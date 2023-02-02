@@ -31,7 +31,7 @@ from tempfile import TemporaryDirectory
 import os
 import logging
 from nod_stable_diffusion_training.testing import assert_array_list_almost_equal
-from nod_stable_diffusion_training.iree_jax import create_optimizer, load_train_state, JaxTrainer, train_jax_moduel, build_iree_module, train_iree_module, create_small_model_train_state, create_dataloader, create_iree_jax_program
+from nod_stable_diffusion_training.iree_jax import create_optimizer, load_train_state, JaxTrainer, train_jax_moduel, build_iree_module, train_iree_module, create_small_model_train_state, create_dataloader, create_iree_jax_program, create_full_model_train_state
 import tempfile
 from copy import deepcopy
 
@@ -88,7 +88,7 @@ def build_iree_module_in_dir(
     return module
 
 
-def test_training_with_iree_jax():
+def test_training_with_iree_jax_pretrained():
     """Test that training with IREE Jax produces the same result as Jax.
     The model tested is a full pretrained version."""
     seed = 12345
@@ -158,14 +158,30 @@ def test_train_with_iree_jax_small_model():
     pretrained_model_name_or_path = "flax/stable-diffusion-2-1"
     tokenizer = CLIPTokenizer.from_pretrained(pretrained_model_name_or_path,
                                               subfolder="tokenizer")
-    dataloader = create_dataloader(dataset, tokenizer=tokenizer, seed=seed)
+    dataloader = create_dataloader(dataset, tokenizer=tokenizer, seed=seed, resolution=8)
 
     set_seed(seed)
     train_jax_moduel(trainer=jax_trainer, dataloader=dataloader)
 
 
-if __name__ == "__main__":
-    pytest.main(sys.argv)
+def test_train_with_iree_jax_full_model():
+    """Test that training with IREE Jax produces the same result as Jax.
+    The model tested is as small as possible."""
+    seed = 12345
+    optimizer = create_optimizer()
+    train_state = create_full_model_train_state(optimizer=optimizer,
+                                                 seed=seed)
+    jax_trainer = JaxTrainer(train_state=train_state)
+
+    dataset = load_dataset(path="lambdalabs/pokemon-blip-captions")
+    pretrained_model_name_or_path = "flax/stable-diffusion-2-1"
+    tokenizer = CLIPTokenizer.from_pretrained(pretrained_model_name_or_path,
+                                              subfolder="tokenizer")
+    dataloader = create_dataloader(dataset, tokenizer=tokenizer, seed=seed)
+
+    set_seed(seed)
+    train_jax_moduel(trainer=jax_trainer, dataloader=dataloader)
+
 
 def test_scratchpad():
     """Test that training with IREE Jax produces the same result as Jax.
@@ -189,3 +205,7 @@ def test_scratchpad():
 
     jax_trainer = JaxTrainer(jax_train_state)
     train_jax_moduel(jax_trainer, dataloader)
+
+
+if __name__ == "__main__":
+    pytest.main(sys.argv)
