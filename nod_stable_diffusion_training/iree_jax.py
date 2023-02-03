@@ -164,41 +164,37 @@ def create_small_model_train_state(optimizer, seed, weight_dtype=jnp.float32):
         projection_dim=1,
         torch_dtype=weight_dtype.dtype.name,
         transformers_version="4.25.1",
-        vocab_size=49408
-    ),
+        vocab_size=49408),
                                      dtype=weight_dtype,
                                      seed=seed)
-    vae = FlaxAutoencoderKL(
-        in_channels = 3,
-        out_channels = 3,
-        down_block_types = ['DownEncoderBlock2D'],
-        up_block_types = ['UpDecoderBlock2D'],
-        block_out_channels = [2],
-        layers_per_block = 1,
-        act_fn = 'silu',
-        latent_channels = 1,
-        norm_num_groups = 2,
-        sample_size = 48,
-        dtype=weight_dtype
-    )
+    vae = FlaxAutoencoderKL(in_channels=3,
+                            out_channels=3,
+                            down_block_types=['DownEncoderBlock2D'],
+                            up_block_types=['UpDecoderBlock2D'],
+                            block_out_channels=[2],
+                            layers_per_block=1,
+                            act_fn='silu',
+                            latent_channels=1,
+                            norm_num_groups=2,
+                            sample_size=48,
+                            dtype=weight_dtype)
     vae_params = vae.init_weights(rng=rng)
     unet = FlaxUNet2DConditionModel(
-        sample_size = 6,
-        in_channels = 1,
-        out_channels = 1,
-        down_block_types = ['CrossAttnDownBlock2D', 'DownBlock2D'],
-        up_block_types = ['UpBlock2D', 'CrossAttnUpBlock2D'],
-        only_cross_attention = False,
-        block_out_channels = [32, 32],
-        layers_per_block = 1,
-        attention_head_dim = [1, 1],
-        cross_attention_dim = 1,
-        dropout = 0.0,
-        use_linear_projection = True,
-        dtype = weight_dtype,
-        flip_sin_to_cos = True,
-        freq_shift = 0
-    )
+        sample_size=6,
+        in_channels=1,
+        out_channels=1,
+        down_block_types=['CrossAttnDownBlock2D', 'DownBlock2D'],
+        up_block_types=['UpBlock2D', 'CrossAttnUpBlock2D'],
+        only_cross_attention=False,
+        block_out_channels=[32, 32],
+        layers_per_block=1,
+        attention_head_dim=[1, 1],
+        cross_attention_dim=1,
+        dropout=0.0,
+        use_linear_projection=True,
+        dtype=weight_dtype,
+        flip_sin_to_cos=True,
+        freq_shift=0)
     unet_params = unet.init_weights(rng=rng)
     unet_optimizer_state = optimizer.init(unet_params)
     noise_scheduler = FlaxDDPMScheduler(beta_start=0.00085,
@@ -240,41 +236,50 @@ def create_full_model_train_state(optimizer, seed, weight_dtype=jnp.float32):
         projection_dim=512,
         torch_dtype=weight_dtype.dtype.name,
         transformers_version="4.25.1",
-        vocab_size=49408
-    ),
+        vocab_size=49408),
                                      dtype=weight_dtype,
                                      seed=seed)
-    vae = FlaxAutoencoderKL(
-        in_channels = 3,
-        out_channels = 3,
-        down_block_types = ['DownEncoderBlock2D', 'DownEncoderBlock2D', 'DownEncoderBlock2D', 'DownEncoderBlock2D'],
-        up_block_types = ['UpDecoderBlock2D', 'UpDecoderBlock2D', 'UpDecoderBlock2D', 'UpDecoderBlock2D'],
-        block_out_channels = [128, 256, 512, 512],
-        layers_per_block = 2,
-        act_fn = 'silu',
-        latent_channels = 4,
-        norm_num_groups = 32,
-        sample_size = 768,
-        dtype=weight_dtype
-    )
+    vae = FlaxAutoencoderKL(in_channels=3,
+                            out_channels=3,
+                            down_block_types=[
+                                'DownEncoderBlock2D', 'DownEncoderBlock2D',
+                                'DownEncoderBlock2D', 'DownEncoderBlock2D'
+                            ],
+                            up_block_types=[
+                                'UpDecoderBlock2D', 'UpDecoderBlock2D',
+                                'UpDecoderBlock2D', 'UpDecoderBlock2D'
+                            ],
+                            block_out_channels=[128, 256, 512, 512],
+                            layers_per_block=2,
+                            act_fn='silu',
+                            latent_channels=4,
+                            norm_num_groups=32,
+                            sample_size=768,
+                            dtype=weight_dtype)
     vae_params = vae.init_weights(rng=rng)
-    unet = FlaxUNet2DConditionModel(
-        sample_size = 96,
-        in_channels = 4,
-        out_channels = 4,
-        down_block_types = ['CrossAttnDownBlock2D', 'CrossAttnDownBlock2D', 'CrossAttnDownBlock2D', 'DownBlock2D'],
-        up_block_types = ['UpBlock2D', 'CrossAttnUpBlock2D', 'CrossAttnUpBlock2D', 'CrossAttnUpBlock2D'],
-        only_cross_attention = False,
-        block_out_channels = [320, 640, 1280, 1280],
-        layers_per_block = 2,
-        attention_head_dim = [5, 10, 20, 20],
-        cross_attention_dim = 1024,
-        dropout = 0.0,
-        use_linear_projection = True,
-        dtype = weight_dtype,
-        flip_sin_to_cos = True,
-        freq_shift = 0
-    )
+    unet = FlaxUNet2DConditionModel(sample_size=96,
+                                    in_channels=4,
+                                    out_channels=4,
+                                    down_block_types=[
+                                        'CrossAttnDownBlock2D',
+                                        'CrossAttnDownBlock2D',
+                                        'CrossAttnDownBlock2D', 'DownBlock2D'
+                                    ],
+                                    up_block_types=[
+                                        'UpBlock2D', 'CrossAttnUpBlock2D',
+                                        'CrossAttnUpBlock2D',
+                                        'CrossAttnUpBlock2D'
+                                    ],
+                                    only_cross_attention=False,
+                                    block_out_channels=[320, 640, 1280, 1280],
+                                    layers_per_block=2,
+                                    attention_head_dim=[5, 10, 20, 20],
+                                    cross_attention_dim=1024,
+                                    dropout=0.0,
+                                    use_linear_projection=True,
+                                    dtype=weight_dtype,
+                                    flip_sin_to_cos=True,
+                                    freq_shift=0)
     unet_params = unet.init_weights(rng=rng)
     unet_optimizer_state = optimizer.init(unet_params)
     noise_scheduler = FlaxDDPMScheduler(beta_start=0.00085,
@@ -292,6 +297,7 @@ def create_full_model_train_state(optimizer, seed, weight_dtype=jnp.float32):
                       noise_scheduler=noise_scheduler,
                       noise_scheduler_state=noise_scheduler_state,
                       rng=rng)
+
 
 def make_train_step_pure_fn(train_state: TrainState):
 
@@ -326,7 +332,6 @@ def make_train_step_pure_fn(train_state: TrainState):
             # (this is the forward diffusion process)
             noisy_latents = train_state.noise_scheduler.add_noise(
                 train_state.noise_scheduler_state, latents, noise, timesteps)
-            print(f"noisy_latents.shape = {noisy_latents.shape}")
 
             # Get the text embedding for conditioning
             encoder_hidden_states = train_state.text_encoder(
@@ -334,7 +339,6 @@ def make_train_step_pure_fn(train_state: TrainState):
                 params=train_state.text_encoder.params,
                 train=False,
             )[0]
-            print(f"encoder_hidden_states.shape = {encoder_hidden_states.shape}")
 
             # Predict the noise residual and compute loss
             model_pred = train_state.unet.apply({

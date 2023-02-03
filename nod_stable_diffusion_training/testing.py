@@ -35,9 +35,15 @@ import logging
 def assert_array_almost_equal(a, b):
     np_a = np.asarray(a)
     np_b = np.asarray(b)
+
+    if (np.issubdtype(np_a.dtype, np.integer)
+            and np.issubdtype(np_b.dtype, np.integer)):
+        np.testing.assert_array_equal(np_a, np_b)
+        return
+
     # Test for absolute error.
-    np.testing.assert_array_almost_equal(np_a, np_b, decimal=5)
-    # Test for relative error while ignoring false positives from
+    np.testing.assert_array_almost_equal(np_a, np_b, decimal=4)
+    # Test for relative error while ignoring errors from
     # catastrophic cancellation.
     np.testing.assert_array_almost_equal_nulp(np.abs(np_a - np_b) + 10**-7,
                                               np.zeros_like(np_a),

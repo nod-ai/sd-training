@@ -95,12 +95,6 @@ def test_training_with_iree_jax_pretrained():
     set_seed(seed)
     pretrained_model_name_or_path = "flax/stable-diffusion-2-1"
 
-    # Downloading and loading a dataset from the hub.
-    dataset = load_dataset(path="lambdalabs/pokemon-blip-captions")
-    tokenizer = CLIPTokenizer.from_pretrained(pretrained_model_name_or_path,
-                                              subfolder="tokenizer")
-    dataloader = create_dataloader(dataset, tokenizer=tokenizer, seed=seed)
-
     rng = jax.random.PRNGKey(seed)
     jax_train_state = load_train_state(
         optimizer=create_optimizer(),
@@ -108,6 +102,12 @@ def test_training_with_iree_jax_pretrained():
         rng=rng,
         weight_dtype=jnp.float32)
     iree_train_state = deepcopy(jax_train_state)
+
+    # Downloading and loading a dataset from the hub.
+    dataset = load_dataset(path="lambdalabs/pokemon-blip-captions")
+    tokenizer = CLIPTokenizer.from_pretrained(pretrained_model_name_or_path,
+                                              subfolder="tokenizer")
+    dataloader = create_dataloader(dataset, tokenizer=tokenizer, seed=seed)
 
     sample_batch = None
     for batch in dataloader:
@@ -145,66 +145,113 @@ def test_training_with_iree_jax_pretrained():
         tree_flatten(iree_unet_params)[0])
 
 
-def test_train_with_iree_jax_small_model():
+def test_training_with_iree_jax_small_model():
     """Test that training with IREE Jax produces the same result as Jax.
     The model tested is as small as possible."""
     seed = 12345
+    set_seed(seed)
     optimizer = create_optimizer()
-    train_state = create_small_model_train_state(optimizer=optimizer,
-                                                 seed=seed)
-    jax_trainer = JaxTrainer(train_state=train_state)
-
-    dataset = load_dataset(path="lambdalabs/pokemon-blip-captions")
-    pretrained_model_name_or_path = "flax/stable-diffusion-2-1"
-    tokenizer = CLIPTokenizer.from_pretrained(pretrained_model_name_or_path,
-                                              subfolder="tokenizer")
-    dataloader = create_dataloader(dataset, tokenizer=tokenizer, seed=seed, resolution=8)
-
-    set_seed(seed)
-    train_jax_moduel(trainer=jax_trainer, dataloader=dataloader)
-
-
-def test_train_with_iree_jax_full_model():
-    """Test that training with IREE Jax produces the same result as Jax.
-    The model tested is as small as possible."""
-    seed = 12345
-    optimizer = create_optimizer()
-    train_state = create_full_model_train_state(optimizer=optimizer,
-                                                 seed=seed)
-    jax_trainer = JaxTrainer(train_state=train_state)
-
-    dataset = load_dataset(path="lambdalabs/pokemon-blip-captions")
-    pretrained_model_name_or_path = "flax/stable-diffusion-2-1"
-    tokenizer = CLIPTokenizer.from_pretrained(pretrained_model_name_or_path,
-                                              subfolder="tokenizer")
-    dataloader = create_dataloader(dataset, tokenizer=tokenizer, seed=seed)
-
-    set_seed(seed)
-    train_jax_moduel(trainer=jax_trainer, dataloader=dataloader)
-
-
-def test_scratchpad():
-    """Test that training with IREE Jax produces the same result as Jax.
-    The model tested is a full pretrained version."""
-    seed = 12345
-    set_seed(seed)
-    pretrained_model_name_or_path = "flax/stable-diffusion-2-1"
+    jax_train_state = create_small_model_train_state(optimizer=optimizer,
+                                                     seed=seed)
+    iree_train_state = deepcopy(jax_train_state)
 
     # Downloading and loading a dataset from the hub.
     dataset = load_dataset(path="lambdalabs/pokemon-blip-captions")
+    pretrained_model_name_or_path = "flax/stable-diffusion-2-1"
+    tokenizer = CLIPTokenizer.from_pretrained(pretrained_model_name_or_path,
+                                              subfolder="tokenizer")
+    dataloader = create_dataloader(dataset,
+                                   tokenizer=tokenizer,
+                                   seed=seed,
+                                   resolution=8)
+
+    sample_batch = None
+    for batch in dataloader:
+        sample_batch = batch
+        break
+    assert (sample_batch is not None)
+
+    def get_iree_jax_program():
+        return create_iree_jax_program(iree_train_state, sample_batch)
+
+    iree_module = build_iree_module_in_dir(
+        dataloader=dataloader,
+        get_iree_jax_program=get_iree_jax_program,
+        artifacts_dir=os.getcwd(),
+        use_cache=True,
+        iree_backend="llvm-cpu",
+        iree_runtime="local-task")
+    train_iree_module(module=iree_module, dataloader=dataloader)
+    logger.debug("Iree train step done.")
+    iree_unet_optimizer_state = iree_module.get_unet_optimizer_state()
+    iree_unet_params = iree_module.get_unet_params()
+
+    jax_trainer = JaxTrainer(jax_train_state)
+    train_jax_moduel(jax_trainer, dataloader)
+    logger.debug("Jax train step done.")
+    jax_unet_optimizer_state = jax_train_state.unet_optimizer_state
+    jax_unet_params = jax_train_state.unet_params
+    del jax_train_state
+
+    assert_array_list_almost_equal(
+        tree_flatten(jax_unet_optimizer_state)[0],
+        tree_flatten(iree_unet_optimizer_state)[0])
+    assert_array_list_almost_equal(
+        tree_flatten(jax_unet_params)[0],
+        tree_flatten(iree_unet_params)[0])
+
+
+def test_training_with_iree_jax_full_model():
+    """Test that training with IREE Jax produces the same result as Jax.
+    The model tested is as small as possible."""
+    seed = 12345
+    set_seed(seed)
+    optimizer = create_optimizer()
+    jax_train_state = create_full_model_train_state(optimizer=optimizer,
+                                                    seed=seed)
+    iree_train_state = deepcopy(jax_train_state)
+
+    # Downloading and loading a dataset from the hub.
+    dataset = load_dataset(path="lambdalabs/pokemon-blip-captions")
+    pretrained_model_name_or_path = "flax/stable-diffusion-2-1"
     tokenizer = CLIPTokenizer.from_pretrained(pretrained_model_name_or_path,
                                               subfolder="tokenizer")
     dataloader = create_dataloader(dataset, tokenizer=tokenizer, seed=seed)
 
-    rng = jax.random.PRNGKey(seed)
-    jax_train_state = load_train_state(
-        optimizer=create_optimizer(),
-        pretrained_model_name_or_path=pretrained_model_name_or_path,
-        rng=rng,
-        weight_dtype=jnp.float32)
+    sample_batch = None
+    for batch in dataloader:
+        sample_batch = batch
+        break
+    assert (sample_batch is not None)
+
+    def get_iree_jax_program():
+        return create_iree_jax_program(iree_train_state, sample_batch)
+
+    iree_module = build_iree_module_in_dir(
+        dataloader=dataloader,
+        get_iree_jax_program=get_iree_jax_program,
+        artifacts_dir=os.getcwd(),
+        use_cache=True,
+        iree_backend="cuda",
+        iree_runtime="cuda")
+    train_iree_module(module=iree_module, dataloader=dataloader)
+    logger.debug("Iree train step done.")
+    iree_unet_optimizer_state = iree_module.get_unet_optimizer_state()
+    iree_unet_params = iree_module.get_unet_params()
 
     jax_trainer = JaxTrainer(jax_train_state)
     train_jax_moduel(jax_trainer, dataloader)
+    logger.debug("Jax train step done.")
+    jax_unet_optimizer_state = jax_train_state.unet_optimizer_state
+    jax_unet_params = jax_train_state.unet_params
+    del jax_train_state
+
+    assert_array_list_almost_equal(
+        tree_flatten(jax_unet_optimizer_state)[0],
+        tree_flatten(iree_unet_optimizer_state)[0])
+    assert_array_list_almost_equal(
+        tree_flatten(jax_unet_params)[0],
+        tree_flatten(iree_unet_params)[0])
 
 
 if __name__ == "__main__":
