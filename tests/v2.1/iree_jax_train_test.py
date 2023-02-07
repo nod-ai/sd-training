@@ -9,8 +9,13 @@ from iree.jax import Program
 from jax.tree_util import tree_flatten
 import os
 import logging
-from nod_stable_diffusion_training.testing import assert_array_list_almost_equal, main, args as testing_args
-from nod_stable_diffusion_training.iree_jax import create_optimizer, load_train_state, JaxTrainer, train_jax_moduel, build_iree_module, train_iree_module, create_small_model_train_state, create_dataloader, create_iree_jax_program, create_full_model_train_state
+from nod_stable_diffusion_training.testing import (assert_array_list_equal,
+                                                   assert_array_list_allclose,
+                                                   main, args as testing_args)
+from nod_stable_diffusion_training.iree_jax import (
+    create_optimizer, load_train_state, JaxTrainer, train_jax_moduel,
+    build_iree_module, train_iree_module, create_small_model_train_state,
+    create_dataloader, create_iree_jax_program, create_full_model_train_state)
 from copy import deepcopy
 
 logger = logging.getLogger(__name__)
@@ -47,11 +52,11 @@ def jax_train_pretrained(dataloader: torch.utils.data.DataLoader,
 
 def build_iree_module_in_dir(
     dataloader: torch.utils.data.DataLoader,
+    iree_backend,
+    iree_runtime,
     get_iree_jax_program: Callable[[], Program],
     artifacts_dir: str,
     use_cache: bool = True,
-    iree_backend: str = "llvm-cpu",
-    iree_runtime: str = "local-task",
 ):
     module = build_iree_module(
         get_iree_jax_program=get_iree_jax_program,
@@ -115,12 +120,12 @@ def test_training_with_iree_jax_pretrained():
     jax_unet_params = jax_train_state.unet_params
     del jax_train_state
 
-    assert_array_list_almost_equal(
-        tree_flatten(jax_unet_optimizer_state)[0],
-        tree_flatten(iree_unet_optimizer_state)[0])
-    assert_array_list_almost_equal(
-        tree_flatten(jax_unet_params)[0],
-        tree_flatten(iree_unet_params)[0])
+    assert_array_list_allclose(
+        tree_flatten(iree_unet_optimizer_state)[0],
+        tree_flatten(jax_unet_optimizer_state)[0])
+    assert_array_list_allclose(
+        tree_flatten(iree_unet_params)[0],
+        tree_flatten(jax_unet_params)[0])
 
 
 def test_training_with_iree_jax_small_model():
@@ -128,9 +133,10 @@ def test_training_with_iree_jax_small_model():
     The model tested is as small as possible."""
     seed = 12345
     set_seed(seed)
-    optimizer = create_optimizer()
+    optimizer = create_optimizer(learning_rate=1e-4)
     jax_train_state = create_small_model_train_state(optimizer=optimizer,
-                                                     seed=seed)
+                                                     seed=seed,
+                                                     output_gradient=True)
     iree_train_state = deepcopy(jax_train_state)
 
     # Downloading and loading a dataset from the hub.
@@ -159,24 +165,34 @@ def test_training_with_iree_jax_small_model():
         use_cache=True,
         iree_backend=testing_args.target_backend,
         iree_runtime=testing_args.driver)
-    train_iree_module(module=iree_module, dataloader=dataloader)
+
+    assert_array_list_equal(
+        tree_flatten(iree_module.get_unet_optimizer_state())[0],
+        tree_flatten(jax_train_state.unet_optimizer_state)[0])
+    assert_array_list_equal(
+        tree_flatten(iree_module.get_unet_params())[0],
+        tree_flatten(jax_train_state.unet_params)[0])
+
+    iree_metrics = train_iree_module(module=iree_module, dataloader=dataloader)
     logger.debug("Iree train step done.")
     iree_unet_optimizer_state = iree_module.get_unet_optimizer_state()
     iree_unet_params = iree_module.get_unet_params()
 
     jax_trainer = JaxTrainer(jax_train_state)
-    train_jax_moduel(jax_trainer, dataloader)
+    jax_metrics = train_jax_moduel(jax_trainer, dataloader)
     logger.debug("Jax train step done.")
     jax_unet_optimizer_state = jax_train_state.unet_optimizer_state
     jax_unet_params = jax_train_state.unet_params
-    del jax_train_state
 
-    assert_array_list_almost_equal(tree_flatten(jax_unet_optimizer_state)[0],
-                                   tree_flatten(iree_unet_optimizer_state)[0],
-                                   decimal=4)
-    assert_array_list_almost_equal(tree_flatten(jax_unet_params)[0],
-                                   tree_flatten(iree_unet_params)[0],
-                                   decimal=4)
+    assert_array_list_allclose(
+        tree_flatten(iree_metrics)[0],
+        tree_flatten(jax_metrics)[0])
+    assert_array_list_allclose(
+        tree_flatten(iree_unet_optimizer_state)[0],
+        tree_flatten(jax_unet_optimizer_state)[0])
+    assert_array_list_allclose(
+        tree_flatten(iree_unet_params)[0],
+        tree_flatten(jax_unet_params)[0])
 
 
 def test_training_with_iree_jax_full_model():
@@ -224,12 +240,12 @@ def test_training_with_iree_jax_full_model():
     jax_unet_params = jax_train_state.unet_params
     del jax_train_state
 
-    assert_array_list_almost_equal(
-        tree_flatten(jax_unet_optimizer_state)[0],
-        tree_flatten(iree_unet_optimizer_state)[0])
-    assert_array_list_almost_equal(
-        tree_flatten(jax_unet_params)[0],
-        tree_flatten(iree_unet_params)[0])
+    assert_array_list_allclose(
+        tree_flatten(iree_unet_optimizer_state)[0],
+        tree_flatten(jax_unet_optimizer_state)[0])
+    assert_array_list_allclose(
+        tree_flatten(iree_unet_params)[0],
+        tree_flatten(jax_unet_params)[0])
 
 
 if __name__ == "__main__":

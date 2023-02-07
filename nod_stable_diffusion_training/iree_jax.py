@@ -48,10 +48,10 @@ def create_optimizer(learning_rate=1e-4,
                      adam_epsilon=1e-08,
                      adam_weight_decay=1e-2,
                      max_grad_norm=1.0):
-    constant_scheduler = optax.constant_schedule(learning_rate)
+    #constant_scheduler = optax.constant_schedule(learning_rate)
 
     adamw = optax.adamw(
-        learning_rate=constant_scheduler,
+        learning_rate=learning_rate,
         b1=adam_beta1,
         b2=adam_beta2,
         eps=adam_epsilon,
@@ -69,32 +69,16 @@ class TrainState:
 
     def __init__(self,
                  optimizer,
-                 pretrained_model_name_or_path: str,
+                 text_encoder,
+                 vae,
+                 vae_params,
+                 unet,
+                 unet_params,
+                 unet_optimizer_state,
+                 noise_scheduler,
+                 noise_scheduler_state,
                  rng,
-                 weight_dtype=jnp.float32):
-        # Load models and create wrapper for stable diffusion
-        self.text_encoder = FlaxCLIPTextModel.from_pretrained(
-            pretrained_model_name_or_path,
-            subfolder="text_encoder",
-            dtype=weight_dtype)
-        self.vae, self.vae_params = FlaxAutoencoderKL.from_pretrained(
-            pretrained_model_name_or_path, subfolder="vae", dtype=weight_dtype)
-        self.unet, self.unet_params = FlaxUNet2DConditionModel.from_pretrained(
-            pretrained_model_name_or_path,
-            subfolder="unet",
-            dtype=weight_dtype)
-        self.optimizer = optimizer
-        self.unet_optimizer_state = optimizer.init(self.unet_params)
-        self.noise_scheduler = FlaxDDPMScheduler(beta_start=0.00085,
-                                                 beta_end=0.012,
-                                                 beta_schedule="scaled_linear",
-                                                 num_train_timesteps=1000)
-        self.noise_scheduler_state = self.noise_scheduler.create_state()
-        self.rng = rng
-
-    def __init__(self, optimizer, text_encoder, vae, vae_params, unet,
-                 unet_params, unet_optimizer_state, noise_scheduler,
-                 noise_scheduler_state, rng):
+                 output_gradient=False):
         self.optimizer = optimizer
         self.text_encoder = text_encoder
         self.vae = vae
@@ -105,12 +89,14 @@ class TrainState:
         self.noise_scheduler = noise_scheduler
         self.noise_scheduler_state = noise_scheduler_state
         self.rng = rng
+        self.output_gradient = output_gradient
 
 
 def load_train_state(optimizer,
                      pretrained_model_name_or_path: str,
                      rng,
-                     weight_dtype=jnp.float32):
+                     output_gradient=False,
+                     weight_dtype=jnp.float32) -> TrainState:
     # Load models and create wrapper for stable diffusion
     text_encoder = FlaxCLIPTextModel.from_pretrained(
         pretrained_model_name_or_path,
@@ -135,14 +121,18 @@ def load_train_state(optimizer,
                              unet_optimizer_state=unet_optimizer_state,
                              noise_scheduler=noise_scheduler,
                              noise_scheduler_state=noise_scheduler_state,
-                             rng=rng)
+                             rng=rng,
+                             output_gradient=output_gradient)
     logger.debug(
         f"Stable Diffusion train state loaded from \"{pretrained_model_name_or_path}\""
     )
     return train_state
 
 
-def create_small_model_train_state(optimizer, seed, weight_dtype=jnp.float32):
+def create_small_model_train_state(optimizer,
+                                   seed,
+                                   weight_dtype=jnp.float32,
+                                   output_gradient=False) -> TrainState:
     rng = jax.random.PRNGKey(seed)
     text_encoder = FlaxCLIPTextModel(config=CLIPTextConfig(
         architectures=["CLIPTextModel"],
@@ -211,10 +201,13 @@ def create_small_model_train_state(optimizer, seed, weight_dtype=jnp.float32):
                       unet_optimizer_state=unet_optimizer_state,
                       noise_scheduler=noise_scheduler,
                       noise_scheduler_state=noise_scheduler_state,
-                      rng=rng)
+                      rng=rng,
+                      output_gradient=output_gradient)
 
 
-def create_full_model_train_state(optimizer, seed, weight_dtype=jnp.float32):
+def create_full_model_train_state(optimizer,
+                                  seed,
+                                  weight_dtype=jnp.float32) -> TrainState:
     rng = jax.random.PRNGKey(seed)
     text_encoder = FlaxCLIPTextModel(config=CLIPTextConfig(
         architectures=["CLIPTextModel"],
@@ -373,7 +366,10 @@ def make_train_step_pure_fn(train_state: TrainState):
             grad, unet_optimizer_state, unet_params)
         new_unet_params = optax.apply_updates(unet_params, unet_param_updates)
 
-        metrics = {"loss": loss}
+        if train_state.output_gradient:
+            metrics = {"loss": loss, "gradient": grad}
+        else:
+            metrics = {"loss": loss}
 
         return new_unet_optimizer_state, new_unet_params, metrics, new_rng
 
@@ -396,8 +392,10 @@ class JaxTrainer:
 
 def train_jax_moduel(trainer: JaxTrainer,
                      dataloader: torch.utils.data.DataLoader):
+    metrics = []
     for batch in dataloader:
-        trainer.train_step(batch)
+        metrics.append(trainer.train_step(batch))
+    return metrics
 
 
 def create_iree_jax_program(train_state: TrainState, example_batch) -> Program:
@@ -470,7 +468,7 @@ def create_default_iree_jax_program_getter(sample_batch,
 
     def get_iree_jax_program():
         optimizer = create_optimizer()
-        train_state = TrainState(
+        train_state = load_train_state(
             optimizer=optimizer,
             pretrained_model_name_or_path=pretrained_model_name_or_path,
             rng=rng,
@@ -483,10 +481,12 @@ def create_default_iree_jax_program_getter(sample_batch,
 
 def train_iree_module(dataloader: torch.utils.data.DataLoader,
                       module: iree_rt.system_api.BoundModule):
+    metrics = []
     for batch in dataloader:
         args = tree_flatten(batch)[0]
         args[0] = np.array(args[0], dtype=np.int32)
-        module.train_step(*args)
+        metrics.append(module.train_step(*args))
+    return metrics
 
 
 def create_dataloader(
