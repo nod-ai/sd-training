@@ -8,12 +8,14 @@ import pytest
 
 Tensor = TypeVar('Tensor')
 
-args = None
+args = {}
 
 
 def main(argv: List[str] = sys.argv):
     global args
-    args, remaining_args = parse_args(argv[1:])
+    new_args, remaining_args = parse_args(argv[1:])
+    args.update(vars(new_args))
+    args = argparse.Namespace(**args)
     pytest.main(args=[argv[0]] + remaining_args)
 
 
@@ -21,6 +23,15 @@ def parse_args(args: List[str] = sys.argv[1:]):
     parser = argparse.ArgumentParser()
     parser.add_argument("--target_backend", type=str, default="llvm-cpu")
     parser.add_argument("--driver", type=str, default="local-task")
+    parser.add_argument("--distribution_count", type=int, default=1)
+    parser.add_argument("--mlir_format",
+                        type=str,
+                        default="bytecode",
+                        choices=["bytecode", "text"])
+    parser.add_argument("--batch_size",
+                        type=int,
+                        default=1,
+                        help="The total batch size accross all devices.")
     return parser.parse_known_args(args=args)
 
 

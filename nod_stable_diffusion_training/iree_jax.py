@@ -28,6 +28,12 @@ from iree import runtime as iree_rt
 from tempfile import TemporaryDirectory
 import logging
 import iree.compiler.tools
+from datetime import datetime
+from flax.jax_utils import replicate
+"""
+Original scrip addapted from
+https://github.com/huggingface/diffusers/blob/main/examples/text_to_image/train_text_to_image_flax.py
+"""
 
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.DEBUG)
@@ -40,6 +46,21 @@ logger.addHandler(ch)
 
 # Will error if the minimal version of diffusers is not installed. Remove at your own risks.
 check_min_version("0.10.0.dev0")
+
+
+def shard(xs, device_count=None):
+    """Helper for pmap to shard a pytree of arrays by local_device_count.
+
+  Args:
+    xs: a pytree of arrays.
+  Returns:
+    A matching pytree with arrays' leading dimensions sharded by the
+    device count.
+  """
+    device_count = jax.local_device_count(
+    ) if device_count is None else device_count
+    return jax.tree_util.tree_map(
+        lambda x: x.reshape((device_count, -1) + x.shape[1:]), xs)
 
 
 def create_optimizer(learning_rate=1e-5,
@@ -78,6 +99,7 @@ class TrainState:
                  noise_scheduler,
                  noise_scheduler_state,
                  rng,
+                 distribution_count: int = 1,
                  output_gradient=False):
         self.optimizer = optimizer
         self.text_encoder = text_encoder
@@ -89,13 +111,21 @@ class TrainState:
         self.noise_scheduler = noise_scheduler
         self.noise_scheduler_state = noise_scheduler_state
         self.rng = rng
+        self.distribution_count = distribution_count
+        if (distribution_count > len(jax.devices())):
+            raise RuntimeError(
+                f"{distribution_count} devices requested to shard accorss, while only {len(jax.devices())} are available. "
+                "Use environment variable XLA_FLAGS to create more logical devices."
+                "E.g. XLA_FLAGS=\"--xla_force_host_platform_device_count=2\"")
         self.output_gradient = output_gradient
+        self.is_mlir_dumped = False
 
 
 def load_train_state(optimizer,
                      pretrained_model_name_or_path: str,
                      rng,
                      output_gradient=False,
+                     distribution_count: int = 1,
                      weight_dtype=jnp.float32) -> TrainState:
     # Load models and create wrapper for stable diffusion
     text_encoder = FlaxCLIPTextModel.from_pretrained(
@@ -122,7 +152,8 @@ def load_train_state(optimizer,
                              noise_scheduler=noise_scheduler,
                              noise_scheduler_state=noise_scheduler_state,
                              rng=rng,
-                             output_gradient=output_gradient)
+                             output_gradient=output_gradient,
+                             distribution_count=distribution_count)
     logger.debug(
         f"Stable Diffusion train state loaded from \"{pretrained_model_name_or_path}\""
     )
@@ -132,6 +163,7 @@ def load_train_state(optimizer,
 def create_small_model_train_state(optimizer,
                                    seed,
                                    weight_dtype=jnp.float32,
+                                   distribution_count: int = 1,
                                    output_gradient=False) -> TrainState:
     rng = jax.random.PRNGKey(seed)
     text_encoder = FlaxCLIPTextModel(config=CLIPTextConfig(
@@ -202,11 +234,13 @@ def create_small_model_train_state(optimizer,
                       noise_scheduler=noise_scheduler,
                       noise_scheduler_state=noise_scheduler_state,
                       rng=rng,
-                      output_gradient=output_gradient)
+                      output_gradient=output_gradient,
+                      distribution_count=distribution_count)
 
 
 def create_full_model_train_state(optimizer,
                                   seed,
+                                  distribution_count: int = 1,
                                   weight_dtype=jnp.float32) -> TrainState:
     rng = jax.random.PRNGKey(seed)
     text_encoder = FlaxCLIPTextModel(config=CLIPTextConfig(
@@ -289,6 +323,7 @@ def create_full_model_train_state(optimizer,
                       unet_optimizer_state=unet_optimizer_state,
                       noise_scheduler=noise_scheduler,
                       noise_scheduler_state=noise_scheduler_state,
+                      distribution_count=distribution_count,
                       rng=rng)
 
 
@@ -361,6 +396,9 @@ def make_train_step_pure_fn(train_state: TrainState):
 
         grad_fn = jax.value_and_grad(compute_loss)
         loss, grad = grad_fn(unet_params)
+        if train_state.distribution_count > 1:
+            grad = jax.lax.pmean(grad, axis_name="batch")
+            loss = jax.lax.pmean(loss, axis_name="batch")
 
         unet_param_updates, new_unet_optimizer_state = train_state.optimizer.update(
             grad, unet_optimizer_state, unet_params)
@@ -393,14 +431,54 @@ class JaxTrainer:
 
     def __init__(self, train_state: TrainState):
         self.train_state = train_state
-        #self._train_step = jax.jit(make_train_step_pure_fn(train_state))
+        self.devices = jax.devices()[:train_state.distribution_count]
+        if len(self.devices) > 1:
+            train_state.unet_optimizer_state = replicate(
+                train_state.unet_optimizer_state, devices=self.devices)
+            train_state.unet_params = replicate(train_state.unet_params,
+                                                devices=self.devices)
+            train_state.rng = jax.random.split(train_state.rng,
+                                               len(self.devices))
         self._train_step = make_train_step_pure_fn(train_state)
+        if train_state.distribution_count > 1:
+            self._train_step = jax.pmap(self._train_step,
+                                        axis_name="batch",
+                                        devices=self.devices)
         self._apply_gradient = make_apply_gradient_pure_fn(train_state)
+        self.train_step_count = 0
 
     def train_step(self, batch):
+        if len(self.devices) > 1:
+            batch = shard(batch, device_count=len(self.devices))
+        if "JAX_MODULE_DUMP_PATH" in os.environ:
+            os.makedirs(os.environ["JAX_MODULE_DUMP_PATH"], exist_ok=True)
+            if not self.train_state.is_mlir_dumped:
+                mlir_module = self._train_step.lower(
+                    batch, self.train_state.unet_optimizer_state,
+                    self.train_state.unet_params,
+                    self.train_state.rng).compiler_ir()
+                with open(
+                        os.path.join(
+                            os.environ["JAX_MODULE_DUMP_PATH"],
+                            "jax_stable_diffusion_pure_train_step_fn.mlir"),
+                        "w") as f:
+                    mlir_module.operation.print(f)
+                self.is_mlir_dumped = True
+            input_file_name = os.path.join(
+                os.environ["JAX_MODULE_DUMP_PATH"],
+                f"jax_stable_diffusion_pure_train_step_fn_input_{self.train_step_count}.npz"
+            )
+            args, _ = tree_flatten([
+                batch, self.train_state.unet_optimizer_state,
+                self.train_state.unet_params, self.train_state.rng
+            ])
+            if len(self.devices) > 1:
+                args = [a[0] for a in args]
+            np.savez(input_file_name, *args)
         self.train_state.unet_optimizer_state, self.train_state.unet_params, metrics, self.train_state.rng = self._train_step(
             batch, self.train_state.unet_optimizer_state,
             self.train_state.unet_params, self.train_state.rng)
+        self.train_step_count += 1
         return metrics
 
     def apply_gradient(self, gradient):
@@ -420,6 +498,8 @@ def train_jax_moduel(trainer: JaxTrainer,
 def create_iree_jax_program(train_state: TrainState, example_batch) -> Program:
     train_step_fn = make_train_step_pure_fn(train_state)
     apply_gradient_fn = make_apply_gradient_pure_fn(train_state)
+    batch = shard(example_batch, device_count=train_state.distribution_count
+                  ) if train_state.distribution_count > 1 else example_batch
 
     class IreeJaxStableDiffusionModule(Program):
         _unet_optimizer_state = train_state.unet_optimizer_state
@@ -437,7 +517,7 @@ def create_iree_jax_program(train_state: TrainState, example_batch) -> Program:
         def get_unet_params(self):
             return self._unet_params
 
-        def train_step(self, batch=like(example_batch)):
+        def train_step(self, batch=like(batch)):
             self._unet_optimizer_state, self._unet_params, metrics, self._rng = self._train_step(
                 batch, self._unet_optimizer_state, self._unet_params,
                 self._rng)
@@ -462,15 +542,25 @@ def create_iree_jax_program(train_state: TrainState, example_batch) -> Program:
     return IreeJaxStableDiffusionModule()
 
 
-def build_mlir_module(module: Program, path: str):
-    with open(path, "wb") as f:
-        Program.save(module, f)
+def build_mlir_module(module: Program,
+                      path: str,
+                      mlir_format: str = "bytecode"):
+    if mlir_format == "bytecode":
+        with open(path, "wb") as f:
+            Program.save(module, f)
+    elif mlir_format == "text":
+        with open(path, "w") as f:
+            mlir_module = Program.get_mlir_module(module)
+            mlir_module.operation.print(f)
+    else:
+        raise RuntimeError("Invalid MLIR format \"{mlir_format}\".")
 
 
 def build_iree_module(get_iree_jax_program: Callable[[], Program],
                       mlir_module_path: str,
                       iree_module_path: str,
                       use_cache: bool = True,
+                      mlir_format: str = "bytecode",
                       iree_backend: str = "llvm-cpu",
                       iree_runtime: str = "local-task"):
     # Train for 1 step and return Unet train state
@@ -478,7 +568,9 @@ def build_iree_module(get_iree_jax_program: Callable[[], Program],
     should_make_mlir = not use_cache or not os.path.exists(mlir_module_path)
     if should_make_mlir:
         iree_jax_program = get_iree_jax_program()
-        build_mlir_module(module=iree_jax_program, path=mlir_module_path)
+        build_mlir_module(module=iree_jax_program,
+                          path=mlir_module_path,
+                          mlir_format=mlir_format)
         del iree_jax_program
         logger.debug(f"MLIR written to \"{mlir_module_path}\".")
 
@@ -499,6 +591,7 @@ def build_iree_module(get_iree_jax_program: Callable[[], Program],
 def create_default_iree_jax_program_getter(sample_batch,
                                            pretrained_model_name_or_path,
                                            rng,
+                                           distribution_count: int = 1,
                                            weight_dtype=jnp.float32):
 
     def get_iree_jax_program():
@@ -507,6 +600,7 @@ def create_default_iree_jax_program_getter(sample_batch,
             optimizer=optimizer,
             pretrained_model_name_or_path=pretrained_model_name_or_path,
             rng=rng,
+            distribution_count=distribution_count,
             weight_dtype=weight_dtype)
         iree_jax_program = create_iree_jax_program(train_state, sample_batch)
         return iree_jax_program
@@ -517,11 +611,26 @@ def create_default_iree_jax_program_getter(sample_batch,
 def train_iree_module(dataloader: torch.utils.data.DataLoader,
                       module: iree_rt.system_api.BoundModule):
     metrics = []
+    train_step_count = 0
     for batch in dataloader:
         args = tree_flatten(batch)[0]
         args[0] = np.array(args[0], dtype=np.int32)
-        #np.savez_compressed("batch.npz", *args)
-        metrics.append(call_iree_function(module.train_step, *args))
+        if "IREE_MODULE_DUMP_PATH" in os.environ:
+            os.makedirs(os.environ["IREE_MODULE_DUMP_PATH"], exist_ok=True)
+            file_name = os.path.join(
+                os.environ["IREE_MODULE_DUMP_PATH"],
+                f"iree_jax_stable_diffusion_train_step_input_{train_step_count}.npz"
+            )
+            np.savez(file_name, *args)
+        out = call_iree_function(module.train_step, *args)
+        metrics.append(out)
+        if "IREE_MODULE_DUMP_PATH" in os.environ:
+            file_name = os.path.join(
+                os.environ["IREE_MODULE_DUMP_PATH"],
+                f"iree_jax_stable_diffusion_train_step_output_{train_step_count}.npz"
+            )
+            np.savez(file_name, *out)
+        train_step_count += 1
     return metrics
 
 
@@ -530,7 +639,7 @@ def create_dataloader(
     tokenizer: CLIPTokenizer,
     image_column: str = "image",
     caption_column: str = "text",
-    max_train_samples: int = 1,
+    max_train_samples: Optional[int] = None,
     resolution: int = 512,
     center_crop: int = True,
     random_flip: int = True,
@@ -539,6 +648,8 @@ def create_dataloader(
 ) -> torch.utils.data.DataLoader:
     # Preprocessing the datasets.
     # We need to tokenize inputs and targets.
+    if max_train_samples is None:
+        assert (max_train_samples >= train_batch_size)
 
     column_names = dataset["train"].column_names
 
