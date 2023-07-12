@@ -23,7 +23,7 @@ from nod_stable_diffusion_training.iree_jax import (
 from copy import deepcopy
 import numpy as np
 import argparse
-from typing import List
+from typing import List, Optional
 import sys
 import iree.compiler
 import iree.runtime
@@ -280,10 +280,12 @@ def get_shard(rank: int, *args):
     return jax.tree_util.tree_map(lambda x: x[rank], args)
 
 
-def run_shard(shard_index: int, mlir_filepath: str, iree_module_filepath: str,
-              args):
-    os.environ["OMPI_COMM_WORLD_SIZE"] = str(testing_args.distribution_count)
-    os.environ["OMPI_COMM_WORLD_RANK"] = str(shard_index)
+def run_shard(shard_index: Optional[int], mlir_filepath: str,
+              iree_module_filepath: str, args):
+    if testing_args.distribution_count > 1:
+        os.environ["OMPI_COMM_WORLD_SIZE"] = str(
+            testing_args.distribution_count)
+        os.environ["OMPI_COMM_WORLD_RANK"] = str(shard_index)
     iree_module = iree.runtime.system_api.load_vm_flatbuffer_file(
         iree_module_filepath, driver=testing_args.driver)
 
@@ -341,7 +343,9 @@ def test_distributed_iree_module_from_jax_trainer():
 
     shareded_sample_batch = shard(sample_batch,
                                   testing_args.distribution_count)
-    module_args_for_all_shards = (shareded_sample_batch,
+    module_args_for_all_shards = (shareded_sample_batch
+                                  if testing_args.distribution_count > 1 else
+                                  sample_batch,
                                   jax_train_state.unet_optimizer_state,
                                   jax_train_state.unet_params,
                                   jax_train_state.rng)
@@ -352,7 +356,8 @@ def test_distributed_iree_module_from_jax_trainer():
     ]
 
     if testing_args.distribution_count == 1:
-        run_shard(0)
+        run_shard(None, mlir_filepath, iree_module_filepath,
+                  module_args_for_all_shards)
     else:
         with Pool(testing_args.distribution_count) as pool:
             starmap_args = [[
