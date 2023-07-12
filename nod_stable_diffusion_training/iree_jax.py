@@ -63,6 +63,12 @@ def shard(xs, device_count=None):
         lambda x: x.reshape((device_count, -1) + x.shape[1:]), xs)
 
 
+def legalize_array_for_iree_input(array):
+    if array.dtype == np.int64:
+        return np.array(array, dtype=np.int32)
+    return np.array(array, copy=True)
+
+
 def create_optimizer(learning_rate=1e-5,
                      adam_beta1=0.9,
                      adam_beta2=0.999,
@@ -444,6 +450,8 @@ class JaxTrainer:
             self._train_step = jax.pmap(self._train_step,
                                         axis_name="batch",
                                         devices=self.devices)
+        else:
+            self._train_step = jax.jit(self._train_step)
         self._apply_gradient = make_apply_gradient_pure_fn(train_state)
         self.train_step_count = 0
 
@@ -453,16 +461,12 @@ class JaxTrainer:
         if "JAX_MODULE_DUMP_PATH" in os.environ:
             os.makedirs(os.environ["JAX_MODULE_DUMP_PATH"], exist_ok=True)
             if not self.train_state.is_mlir_dumped:
-                mlir_module = self._train_step.lower(
-                    batch, self.train_state.unet_optimizer_state,
-                    self.train_state.unet_params,
-                    self.train_state.rng).compiler_ir()
-                with open(
-                        os.path.join(
-                            os.environ["JAX_MODULE_DUMP_PATH"],
-                            "jax_stable_diffusion_pure_train_step_fn.mlir"),
-                        "w") as f:
-                    mlir_module.operation.print(f)
+                export_mlir_jax_trainer(
+                    self,
+                    batch,
+                    filepath=os.path.join(
+                        os.environ["JAX_MODULE_DUMP_PATH"],
+                        "jax_stable_diffusion_pure_train_step_fn.mlir"))
                 self.is_mlir_dumped = True
             input_file_name = os.path.join(
                 os.environ["JAX_MODULE_DUMP_PATH"],
@@ -493,6 +497,17 @@ def train_jax_moduel(trainer: JaxTrainer,
     for batch in dataloader:
         metrics.append(trainer.train_step(batch))
     return metrics
+
+
+def export_mlir_jax_trainer(trainer: JaxTrainer, batch, filepath: str):
+    if len(trainer.devices) > 1:
+        batch = shard(batch, device_count=len(trainer.devices))
+    mlir_module = trainer._train_step.lower(
+        batch, trainer.train_state.unet_optimizer_state,
+        trainer.train_state.unet_params,
+        trainer.train_state.rng).compiler_ir()
+    with open(filepath, "w") as f:
+        mlir_module.operation.print(f)
 
 
 def create_iree_jax_program(train_state: TrainState, example_batch) -> Program:
@@ -580,7 +595,7 @@ def build_iree_module(get_iree_jax_program: Callable[[], Program],
         iree.compiler.tools.compile_file(input_file=mlir_module_path,
                                          output_file=iree_module_path,
                                          target_backends=[iree_backend],
-                                         input_type="mhlo")
+                                         input_type="stablehlo")
         logger.debug(f"File \"{iree_module_path}\" compiled.")
 
     module = iree_rt.system_api.load_vm_flatbuffer_file(iree_module_path,

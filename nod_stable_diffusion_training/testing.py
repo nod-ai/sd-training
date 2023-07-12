@@ -32,6 +32,10 @@ def parse_args(args: List[str] = sys.argv[1:]):
                         type=int,
                         default=1,
                         help="The total batch size accross all devices.")
+    parser.add_argument("--use_cache",
+                    default=False,
+                    action="store_true",
+                    help="Use intermediate results from previous runs like compiled models.")
     return parser.parse_known_args(args=args)
 
 
