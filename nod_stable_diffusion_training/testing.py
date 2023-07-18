@@ -23,7 +23,7 @@ def parse_args(args: List[str] = sys.argv[1:]):
     parser = argparse.ArgumentParser()
     parser.add_argument("--target_backend", type=str, default="llvm-cpu")
     parser.add_argument("--driver", type=str, default="local-task")
-    parser.add_argument("--distribution_count", type=int, default=1)
+    parser.add_argument("--distribution_count", type=int, default=None)
     parser.add_argument("--mlir_format",
                         type=str,
                         default="bytecode",
@@ -32,10 +32,12 @@ def parse_args(args: List[str] = sys.argv[1:]):
                         type=int,
                         default=1,
                         help="The total batch size accross all devices.")
-    parser.add_argument("--use_cache",
-                    default=False,
-                    action="store_true",
-                    help="Use intermediate results from previous runs like compiled models.")
+    parser.add_argument(
+        "--use_cache",
+        default=False,
+        action="store_true",
+        help="Use intermediate results from previous runs like compiled models."
+    )
     return parser.parse_known_args(args=args)
 
 

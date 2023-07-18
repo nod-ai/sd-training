@@ -27,7 +27,9 @@ from typing import List, Optional
 import sys
 import iree.compiler
 import iree.runtime
+import iree.runtime.distributed
 from multiprocessing import Pool
+from numpy.typing import ArrayLike
 
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.DEBUG)
@@ -276,25 +278,16 @@ def test_training_with_iree_jax_full_model():
         tree_flatten(jax_unet_params)[0])
 
 
-def get_shard(rank: int, *args):
-    return jax.tree_util.tree_map(lambda x: x[rank], args)
-
-
-def run_shard(shard_index: Optional[int], mlir_filepath: str,
-              iree_module_filepath: str, args):
-    if testing_args.distribution_count > 1:
-        os.environ["OMPI_COMM_WORLD_SIZE"] = str(
-            testing_args.distribution_count)
-        os.environ["OMPI_COMM_WORLD_RANK"] = str(shard_index)
-    iree_module = iree.runtime.system_api.load_vm_flatbuffer_file(
-        iree_module_filepath, driver=testing_args.driver)
-
-    with open(f"{mlir_filepath}.shard-{shard_index}.in.npy", "wb") as f:
-        for arr in args:
-            np.save(f, arr)
-
-    # Run IREE module.
-    res = call_iree_function(iree_module.main, *args)
+def swap_shard_axis(arrays: List[ArrayLike]) -> List[List[ArrayLike]]:
+    """Swap axis 0 with 1."""
+    if len(arrays) == 0:
+        return []
+    expected_shards = len(arrays[0])
+    res = [[]] * expected_shards
+    for arr in arrays:
+        assert len(arr) == expected_shards
+        for shard in range(expected_shards):
+            res[shard].append(arr[shard])
     return res
 
 
@@ -302,11 +295,15 @@ def test_distributed_iree_module_from_jax_trainer():
     seed = 12345
     set_seed(seed)
     optimizer = create_optimizer()
-    jax_train_state = create_small_model_train_state(
+    distributed_jax_train_state = create_small_model_train_state(
         optimizer=optimizer,
         seed=seed,
         output_gradient=True,
         distribution_count=testing_args.distribution_count)
+    jax_train_state = create_small_model_train_state(optimizer=optimizer,
+                                                     seed=seed,
+                                                     output_gradient=True,
+                                                     distribution_count=None)
 
     # Downloading and loading a dataset from the hub.
     dataset = load_dataset(path="lambdalabs/pokemon-blip-captions")
@@ -325,14 +322,28 @@ def test_distributed_iree_module_from_jax_trainer():
         break
     assert (sample_batch is not None)
 
+    distributed_jax_trainer = JaxTrainer(distributed_jax_train_state)
     jax_trainer = JaxTrainer(jax_train_state)
 
-    # Export MLIR.
-    mlir_filepath = f"test_compile_iree_module_from_jax_trainer_stable_diffusion_pure_train_step_fn.dist-count-{testing_args.distribution_count}.mlir"
+    # Export MLIRs.
+    distributed_mlir_filepath = f"test_compile_iree_module_from_jax_trainer_stable_diffusion_pure_train_step_fn.dist-count-{testing_args.distribution_count}.mlir"
+    if not testing_args.use_cache or not os.path.exists(
+            distributed_mlir_filepath):
+        export_mlir_jax_trainer(distributed_jax_trainer, sample_batch,
+                                distributed_mlir_filepath)
+    mlir_filepath = f"test_compile_iree_module_from_jax_trainer_stable_diffusion_pure_train_step_fn.mlir"
     if not testing_args.use_cache or not os.path.exists(mlir_filepath):
         export_mlir_jax_trainer(jax_trainer, sample_batch, mlir_filepath)
 
-    # Compile IREE module.
+    # Compile IREE modules.
+    distributed_iree_module_filepath = f"{distributed_mlir_filepath}.{testing_args.target_backend}.vmfb"
+    if not testing_args.use_cache or not os.path.exists(
+            distributed_iree_module_filepath):
+        iree.compiler.tools.compile_file(
+            input_file=distributed_mlir_filepath,
+            output_file=distributed_iree_module_filepath,
+            target_backends=[testing_args.target_backend],
+            input_type="stablehlo")
     iree_module_filepath = f"{mlir_filepath}.{testing_args.target_backend}.vmfb"
     if not testing_args.use_cache or not os.path.exists(iree_module_filepath):
         iree.compiler.tools.compile_file(
@@ -341,32 +352,44 @@ def test_distributed_iree_module_from_jax_trainer():
             target_backends=[testing_args.target_backend],
             input_type="stablehlo")
 
+    # Run non-distributed IREE module.
+    iree_module_args = [
+        sample_batch, jax_train_state.unet_optimizer_state,
+        jax_train_state.unet_params, jax_train_state.rng
+    ]
+    iree_module_args = tree_flatten(iree_module_args)[0]
+    iree_module_args = [
+        legalize_array_for_iree_input(arr) for arr in iree_module_args
+    ]
+    iree_module = iree.runtime.system_api.load_vm_flatbuffer_file(
+        iree_module_filepath, driver=testing_args.driver)
+    iree_results = call_iree_function(iree_module.main, *iree_module_args)
+
+    # Run distributed IREE module.
     shareded_sample_batch = shard(sample_batch,
                                   testing_args.distribution_count)
-    module_args_for_all_shards = (shareded_sample_batch
-                                  if testing_args.distribution_count > 1 else
-                                  sample_batch,
-                                  jax_train_state.unet_optimizer_state,
-                                  jax_train_state.unet_params,
-                                  jax_train_state.rng)
+    module_args_for_all_shards = (
+        shareded_sample_batch,
+        distributed_jax_train_state.unet_optimizer_state,
+        distributed_jax_train_state.unet_params,
+        distributed_jax_train_state.rng)
     module_args_for_all_shards = tree_flatten(module_args_for_all_shards)[0]
     module_args_for_all_shards = [
         legalize_array_for_iree_input(arr)
         for arr in module_args_for_all_shards
     ]
+    module_args_for_all_shards = swap_shard_axis(module_args_for_all_shards)
+    distributed_iree_results = iree.runtime.distributed.run_shards(
+        num_ranks=testing_args.distribution_count,
+        module_filepath=distributed_iree_module_filepath,
+        function="main",
+        inputs=module_args_for_all_shards,
+        driver=testing_args.driver)
 
-    if testing_args.distribution_count == 1:
-        run_shard(None, mlir_filepath, iree_module_filepath,
-                  module_args_for_all_shards)
-    else:
-        with Pool(testing_args.distribution_count) as pool:
-            starmap_args = [[
-                shard_index, mlir_filepath, iree_module_filepath,
-                get_shard(shard_index, *module_args_for_all_shards)
-            ] for shard_index in range(testing_args.distribution_count)]
-            res = pool.starmap(run_shard, starmap_args)
-
-    # TODO: verify result is correct when compared to JAX.
+    for rank, rank_results in enumerate(distributed_iree_results):
+        print_array_list_diff(rank_results, iree_results,
+                              f"rank_{rank}_results")
+        assert_array_list_allclose(rank_results, iree_results)
 
 
 def parse_args(args: List[str] = sys.argv[1:]):

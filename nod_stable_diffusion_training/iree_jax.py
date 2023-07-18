@@ -30,6 +30,7 @@ import logging
 import iree.compiler.tools
 from datetime import datetime
 from flax.jax_utils import replicate
+from numpy.typing import ArrayLike
 """
 Original scrip addapted from
 https://github.com/huggingface/diffusers/blob/main/examples/text_to_image/train_text_to_image_flax.py
@@ -105,7 +106,7 @@ class TrainState:
                  noise_scheduler,
                  noise_scheduler_state,
                  rng,
-                 distribution_count: int = 1,
+                 distribution_count: Optional[int] = None,
                  output_gradient=False):
         self.optimizer = optimizer
         self.text_encoder = text_encoder
@@ -118,7 +119,8 @@ class TrainState:
         self.noise_scheduler_state = noise_scheduler_state
         self.rng = rng
         self.distribution_count = distribution_count
-        if (distribution_count > len(jax.devices())):
+        if (distribution_count is not None
+                and distribution_count > len(jax.devices())):
             raise RuntimeError(
                 f"{distribution_count} devices requested to shard accorss, while only {len(jax.devices())} are available. "
                 "Use environment variable XLA_FLAGS to create more logical devices."
@@ -402,7 +404,7 @@ def make_train_step_pure_fn(train_state: TrainState):
 
         grad_fn = jax.value_and_grad(compute_loss)
         loss, grad = grad_fn(unet_params)
-        if train_state.distribution_count > 1:
+        if train_state.distribution_count is not None:
             grad = jax.lax.pmean(grad, axis_name="batch")
             loss = jax.lax.pmean(loss, axis_name="batch")
 
@@ -437,8 +439,9 @@ class JaxTrainer:
 
     def __init__(self, train_state: TrainState):
         self.train_state = train_state
-        self.devices = jax.devices()[:train_state.distribution_count]
-        if len(self.devices) > 1:
+        self.devices = [] if train_state.distribution_count is None else jax.devices(
+        )[:train_state.distribution_count]
+        if len(self.devices) > 0:
             train_state.unet_optimizer_state = replicate(
                 train_state.unet_optimizer_state, devices=self.devices)
             train_state.unet_params = replicate(train_state.unet_params,
@@ -446,7 +449,7 @@ class JaxTrainer:
             train_state.rng = jax.random.split(train_state.rng,
                                                len(self.devices))
         self._train_step = make_train_step_pure_fn(train_state)
-        if train_state.distribution_count > 1:
+        if train_state.distribution_count is not None:
             self._train_step = jax.pmap(self._train_step,
                                         axis_name="batch",
                                         devices=self.devices)
@@ -456,7 +459,7 @@ class JaxTrainer:
         self.train_step_count = 0
 
     def train_step(self, batch):
-        if len(self.devices) > 1:
+        if len(self.devices) > 0:
             batch = shard(batch, device_count=len(self.devices))
         if "JAX_MODULE_DUMP_PATH" in os.environ:
             os.makedirs(os.environ["JAX_MODULE_DUMP_PATH"], exist_ok=True)
@@ -500,7 +503,7 @@ def train_jax_moduel(trainer: JaxTrainer,
 
 
 def export_mlir_jax_trainer(trainer: JaxTrainer, batch, filepath: str):
-    if len(trainer.devices) > 1:
+    if len(trainer.devices) > 0:
         batch = shard(batch, device_count=len(trainer.devices))
     mlir_module = trainer._train_step.lower(
         batch, trainer.train_state.unet_optimizer_state,
@@ -513,8 +516,8 @@ def export_mlir_jax_trainer(trainer: JaxTrainer, batch, filepath: str):
 def create_iree_jax_program(train_state: TrainState, example_batch) -> Program:
     train_step_fn = make_train_step_pure_fn(train_state)
     apply_gradient_fn = make_apply_gradient_pure_fn(train_state)
-    batch = shard(example_batch, device_count=train_state.distribution_count
-                  ) if train_state.distribution_count > 1 else example_batch
+    batch = example_batch if train_state.distribution_count is None else shard(
+        example_batch, device_count=train_state.distribution_count)
 
     class IreeJaxStableDiffusionModule(Program):
         _unet_optimizer_state = train_state.unet_optimizer_state
