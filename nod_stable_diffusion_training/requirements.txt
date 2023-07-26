@@ -1,0 +1,9 @@
+datasets
+diffusers
+flax
+jax[cpu]
+optax
+torch
+torchvision
+transformers
+typing-extensions
