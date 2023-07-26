@@ -128,6 +128,14 @@ class TrainState:
         self.output_gradient = output_gradient
         self.is_mlir_dumped = False
 
+    def __eq__(self, other) -> bool:
+        if not isinstance(other, TrainState):
+            return False
+        for attr_name, attr in vars(self).items():
+            if attr != getattr(other, attr_name):
+                return False
+        return True
+
 
 def load_train_state(optimizer,
                      pretrained_model_name_or_path: str,

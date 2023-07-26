@@ -28,6 +28,7 @@ import sys
 import iree.compiler
 import iree.runtime
 import iree.runtime.distributed
+import iree.runtime.distributed.sharding_pass_validation
 from multiprocessing import Pool
 from numpy.typing import ArrayLike
 
@@ -278,19 +279,6 @@ def test_training_with_iree_jax_full_model():
         tree_flatten(jax_unet_params)[0])
 
 
-def swap_shard_axis(arrays: List[ArrayLike]) -> List[List[ArrayLike]]:
-    """Swap axis 0 with 1."""
-    if len(arrays) == 0:
-        return []
-    expected_shards = len(arrays[0])
-    res = [[]] * expected_shards
-    for arr in arrays:
-        assert len(arr) == expected_shards
-        for shard in range(expected_shards):
-            res[shard].append(arr[shard])
-    return res
-
-
 def test_distributed_iree_module_from_jax_trainer():
     seed = 12345
     set_seed(seed)
@@ -321,19 +309,18 @@ def test_distributed_iree_module_from_jax_trainer():
         sample_batch = batch
         break
     assert (sample_batch is not None)
+    shareded_sample_batch = shard(sample_batch,
+                                  testing_args.distribution_count)
 
     distributed_jax_trainer = JaxTrainer(distributed_jax_train_state)
-    jax_trainer = JaxTrainer(jax_train_state)
 
     # Export MLIRs.
-    distributed_mlir_filepath = f"test_compile_iree_module_from_jax_trainer_stable_diffusion_pure_train_step_fn.dist-count-{testing_args.distribution_count}.mlir"
+    name_prefix = "test_distributed_iree_module_from_jax_trainer_stable_diffusion_pure_train_step_fn"
+    distributed_mlir_filepath = f"{name_prefix}.dist-count-{testing_args.distribution_count}.mlir"
     if not testing_args.use_cache or not os.path.exists(
             distributed_mlir_filepath):
         export_mlir_jax_trainer(distributed_jax_trainer, sample_batch,
                                 distributed_mlir_filepath)
-    mlir_filepath = f"test_compile_iree_module_from_jax_trainer_stable_diffusion_pure_train_step_fn.mlir"
-    if not testing_args.use_cache or not os.path.exists(mlir_filepath):
-        export_mlir_jax_trainer(jax_trainer, sample_batch, mlir_filepath)
 
     # Compile IREE modules.
     distributed_iree_module_filepath = f"{distributed_mlir_filepath}.{testing_args.target_backend}.vmfb"
@@ -344,30 +331,18 @@ def test_distributed_iree_module_from_jax_trainer():
             output_file=distributed_iree_module_filepath,
             target_backends=[testing_args.target_backend],
             input_type="stablehlo")
-    iree_module_filepath = f"{mlir_filepath}.{testing_args.target_backend}.vmfb"
-    if not testing_args.use_cache or not os.path.exists(iree_module_filepath):
-        iree.compiler.tools.compile_file(
-            input_file=mlir_filepath,
-            output_file=iree_module_filepath,
-            target_backends=[testing_args.target_backend],
-            input_type="stablehlo")
 
-    # Run non-distributed IREE module.
-    iree_module_args = [
-        sample_batch, jax_train_state.unet_optimizer_state,
-        jax_train_state.unet_params, jax_train_state.rng
-    ]
-    iree_module_args = tree_flatten(iree_module_args)[0]
-    iree_module_args = [
-        legalize_array_for_iree_input(arr) for arr in iree_module_args
-    ]
-    iree_module = iree.runtime.system_api.load_vm_flatbuffer_file(
-        iree_module_filepath, driver=testing_args.driver)
-    iree_results = call_iree_function(iree_module.main, *iree_module_args)
+    # Run distributed JAX model.
+    distributed_jax_results = distributed_jax_trainer._train_step(
+        batch=shareded_sample_batch,
+        unet_optimizer_state=distributed_jax_train_state.unet_optimizer_state,
+        unet_params=distributed_jax_train_state.unet_params,
+        rng=distributed_jax_train_state.rng)
+    distributed_jax_results = tree_flatten(distributed_jax_results)[0]
+    distributed_jax_results = iree.runtime.distributed.sharding_pass_validation.swap_shard_axis(
+        distributed_jax_results)
 
     # Run distributed IREE module.
-    shareded_sample_batch = shard(sample_batch,
-                                  testing_args.distribution_count)
     module_args_for_all_shards = (
         shareded_sample_batch,
         distributed_jax_train_state.unet_optimizer_state,
@@ -378,18 +353,21 @@ def test_distributed_iree_module_from_jax_trainer():
         legalize_array_for_iree_input(arr)
         for arr in module_args_for_all_shards
     ]
-    module_args_for_all_shards = swap_shard_axis(module_args_for_all_shards)
-    distributed_iree_results = iree.runtime.distributed.run_shards(
+    module_args_for_all_shards = iree.runtime.distributed.sharding_pass_validation.swap_shard_axis(
+        module_args_for_all_shards)
+    distributed_iree_results = iree.runtime.distributed.run_ranks(
         num_ranks=testing_args.distribution_count,
         module_filepath=distributed_iree_module_filepath,
         function="main",
         inputs=module_args_for_all_shards,
         driver=testing_args.driver)
 
+    assert (len(distributed_iree_results) == len(distributed_jax_results))
     for rank, rank_results in enumerate(distributed_iree_results):
-        print_array_list_diff(rank_results, iree_results,
-                              f"rank_{rank}_results")
-        assert_array_list_allclose(rank_results, iree_results)
+        print_array_list_diff(rank_results, distributed_jax_results[rank],
+                              f"distributed_iree_vs_jax_results_rank_{rank}")
+    for rank, rank_results in enumerate(distributed_iree_results):
+        assert_array_list_allclose(rank_results, distributed_jax_results[rank])
 
 
 def parse_args(args: List[str] = sys.argv[1:]):
