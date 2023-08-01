@@ -15,11 +15,11 @@ from nod_stable_diffusion_training.testing import (assert_array_list_equal,
                                                    as testing_main, args as
                                                    testing_args)
 from nod_stable_diffusion_training.iree_jax import (
-    create_optimizer, load_train_state, JaxTrainer, train_jax_moduel,
-    build_iree_module, train_iree_module, create_small_model_train_state,
-    create_dataloader, create_iree_jax_program, create_full_model_train_state,
-    call_iree_function, export_mlir_jax_trainer, legalize_array_for_iree_input,
-    shard)
+    create_optimizer, load_train_state, JaxTrainer, TrainState,
+    train_jax_moduel, build_iree_module, train_iree_module,
+    create_small_model_train_state, create_dataloader, create_iree_jax_program,
+    create_full_model_train_state, call_iree_function, export_mlir_jax_trainer,
+    legalize_array_for_iree_input, shard)
 from copy import deepcopy
 import numpy as np
 import argparse
@@ -279,27 +279,16 @@ def test_training_with_iree_jax_full_model():
         tree_flatten(jax_unet_params)[0])
 
 
-def test_distributed_iree_module_from_jax_trainer():
-    seed = 12345
-    set_seed(seed)
-    optimizer = create_optimizer()
-    distributed_jax_train_state = create_small_model_train_state(
-        optimizer=optimizer,
-        seed=seed,
-        output_gradient=True,
-        distribution_count=testing_args.distribution_count)
-    jax_train_state = create_small_model_train_state(optimizer=optimizer,
-                                                     seed=seed,
-                                                     output_gradient=True,
-                                                     distribution_count=None)
-
+def test_distributed_training_with_iree(train_state: TrainState,
+                                        output_file_name_prefix: str,
+                                        rng_seed: int):
     # Downloading and loading a dataset from the hub.
     dataset = load_dataset(path="lambdalabs/pokemon-blip-captions")
     tokenizer = CLIPTokenizer.from_pretrained(
         testing_args.pretrained_model_name_or_path, subfolder="tokenizer")
     dataloader = create_dataloader(dataset,
                                    tokenizer=tokenizer,
-                                   seed=seed,
+                                   seed=rng_seed,
                                    resolution=8,
                                    max_train_samples=testing_args.batch_size,
                                    train_batch_size=testing_args.batch_size)
@@ -312,11 +301,10 @@ def test_distributed_iree_module_from_jax_trainer():
     shareded_sample_batch = shard(sample_batch,
                                   testing_args.distribution_count)
 
-    distributed_jax_trainer = JaxTrainer(distributed_jax_train_state)
+    distributed_jax_trainer = JaxTrainer(train_state)
 
     # Export MLIRs.
-    name_prefix = "test_distributed_iree_module_from_jax_trainer_stable_diffusion_pure_train_step_fn"
-    distributed_mlir_filepath = f"{name_prefix}.dist-count-{testing_args.distribution_count}.mlir"
+    distributed_mlir_filepath = f"{output_file_name_prefix}.dist-count-{testing_args.distribution_count}.mlir"
     if not testing_args.use_cache or not os.path.exists(
             distributed_mlir_filepath):
         export_mlir_jax_trainer(distributed_jax_trainer, sample_batch,
@@ -335,19 +323,17 @@ def test_distributed_iree_module_from_jax_trainer():
     # Run distributed JAX model.
     distributed_jax_results = distributed_jax_trainer._train_step(
         batch=shareded_sample_batch,
-        unet_optimizer_state=distributed_jax_train_state.unet_optimizer_state,
-        unet_params=distributed_jax_train_state.unet_params,
-        rng=distributed_jax_train_state.rng)
+        unet_optimizer_state=train_state.unet_optimizer_state,
+        unet_params=train_state.unet_params,
+        rng=train_state.rng)
     distributed_jax_results = tree_flatten(distributed_jax_results)[0]
     distributed_jax_results = iree.runtime.distributed.sharding_pass_validation.swap_shard_axis(
         distributed_jax_results)
 
     # Run distributed IREE module.
-    module_args_for_all_shards = (
-        shareded_sample_batch,
-        distributed_jax_train_state.unet_optimizer_state,
-        distributed_jax_train_state.unet_params,
-        distributed_jax_train_state.rng)
+    module_args_for_all_shards = (shareded_sample_batch,
+                                  train_state.unet_optimizer_state,
+                                  train_state.unet_params, train_state.rng)
     module_args_for_all_shards = tree_flatten(module_args_for_all_shards)[0]
     module_args_for_all_shards = [
         legalize_array_for_iree_input(arr)
@@ -360,7 +346,21 @@ def test_distributed_iree_module_from_jax_trainer():
         module_filepath=distributed_iree_module_filepath,
         function="main",
         inputs=module_args_for_all_shards,
-        driver=testing_args.driver)
+        driver=testing_args.driver,
+        measure_execution_time=True,
+        warmup=1)
+    rank_execution_times_seconds = [
+        rank_results[-1] for rank_results in distributed_iree_results
+    ]
+    distributed_iree_results = [
+        rank_results[:-1] for rank_results in distributed_iree_results
+    ]
+    print(
+        f"rank_execution_times_seconds = {np.array(rank_execution_times_seconds).flatten()}"
+    )
+    print(
+        f"max rank_execution_times_seconds = {np.max(rank_execution_times_seconds)}"
+    )
 
     assert (len(distributed_iree_results) == len(distributed_jax_results))
     for rank, rank_results in enumerate(distributed_iree_results):
@@ -368,6 +368,36 @@ def test_distributed_iree_module_from_jax_trainer():
                               f"distributed_iree_vs_jax_results_rank_{rank}")
     for rank, rank_results in enumerate(distributed_iree_results):
         assert_array_list_allclose(rank_results, distributed_jax_results[rank])
+
+
+def test_data_prallel_small_model_training_with_iree():
+    seed = 12345
+    set_seed(seed)
+    optimizer = create_optimizer()
+    distributed_jax_train_state = create_small_model_train_state(
+        optimizer=optimizer,
+        seed=seed,
+        distribution_count=testing_args.distribution_count)
+    test_distributed_training_with_iree(
+        train_state=distributed_jax_train_state,
+        output_file_name_prefix=
+        "test_data_prallel_small_model_training_with_iree_stable_diffusion_pure_train_step_fn",
+        rng_seed=seed)
+
+
+def test_data_prallel_full_model_training_with_iree():
+    seed = 12345
+    set_seed(seed)
+    optimizer = create_optimizer()
+    distributed_jax_train_state = create_full_model_train_state(
+        optimizer=optimizer,
+        seed=seed,
+        distribution_count=testing_args.distribution_count)
+    test_distributed_training_with_iree(
+        train_state=distributed_jax_train_state,
+        output_file_name_prefix=
+        "test_data_prallel_full_model_training_with_iree_stable_diffusion_pure_train_step_fn",
+        rng_seed=seed)
 
 
 def parse_args(args: List[str] = sys.argv[1:]):
