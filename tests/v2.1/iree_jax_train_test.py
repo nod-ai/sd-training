@@ -281,7 +281,7 @@ def test_training_with_iree_jax_full_model():
 
 def test_distributed_training_with_iree(train_state: TrainState,
                                         output_file_name_prefix: str,
-                                        rng_seed: int):
+                                        resolution: int, rng_seed: int):
     # Downloading and loading a dataset from the hub.
     dataset = load_dataset(path="lambdalabs/pokemon-blip-captions")
     tokenizer = CLIPTokenizer.from_pretrained(
@@ -289,7 +289,7 @@ def test_distributed_training_with_iree(train_state: TrainState,
     dataloader = create_dataloader(dataset,
                                    tokenizer=tokenizer,
                                    seed=rng_seed,
-                                   resolution=8,
+                                   resolution=resolution,
                                    max_train_samples=testing_args.batch_size,
                                    train_batch_size=testing_args.batch_size)
 
@@ -348,7 +348,8 @@ def test_distributed_training_with_iree(train_state: TrainState,
         inputs=module_args_for_all_shards,
         driver=testing_args.driver,
         measure_execution_time=True,
-        warmup=1)
+        warmup=1,
+        call_count=1)
     rank_execution_times_seconds = [
         rank_results[-1] for rank_results in distributed_iree_results
     ]
@@ -380,6 +381,7 @@ def test_data_prallel_small_model_training_with_iree():
         distribution_count=testing_args.distribution_count)
     test_distributed_training_with_iree(
         train_state=distributed_jax_train_state,
+        resolution=8,
         output_file_name_prefix=
         "test_data_prallel_small_model_training_with_iree_stable_diffusion_pure_train_step_fn",
         rng_seed=seed)
@@ -395,6 +397,7 @@ def test_data_prallel_full_model_training_with_iree():
         distribution_count=testing_args.distribution_count)
     test_distributed_training_with_iree(
         train_state=distributed_jax_train_state,
+        resolution=512,
         output_file_name_prefix=
         "test_data_prallel_full_model_training_with_iree_stable_diffusion_pure_train_step_fn",
         rng_seed=seed)
